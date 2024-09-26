@@ -5,23 +5,28 @@ use libc;
 use nix::sys::signal::Signal;
 use nix::sys::wait;
 use nix::{sys::ptrace, unistd::Pid};
-use std::any::Any;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::{env, io};
 
-// fake get_clocktime function to write to user space, will replace VDSO implementation on child
+// fake get_clocktime function to write to user space, will replace VDSO implementation on child process's memory map using ptrace
+// having trouble getting anything meaningful to work through this method, but jurst returning 0 is enough to break the clock
 #[inline(never)]
-unsafe fn fake_clock_gettime(clock_id: libc::clockid_t, res: *mut libc::timespec) -> libc::c_int {
-    let v = libc::clock_gettime(clock_id, res);
+unsafe fn fake_clock_gettime(_clock_id: libc::clockid_t, res: *mut libc::timespec) -> libc::c_int {
+    // let v = libc::clock_gettime(clock_id, res);
 
-    if v == 0 {
-        // set time back 2 seconds
-        (*res).tv_sec -= 2;
-    }
+    // if v == 0 {
+    //     // set time back 2 seconds
+    //     (*res).tv_sec -= 2;
+    // }
 
-    v
+    // *res = libc::timespec{
+    //     tv_sec: 0,
+    //     tv_nsec: 0,
+    // };
+
+    0
 }
 
 // gets the bytes for a function from its byte pointer (super naive)
@@ -36,6 +41,12 @@ unsafe fn get_bytes(func: *const u8) -> Vec<u8> {
         last = *cur;
         res.push(last);
         cur = cur.offset(1);
+    }
+
+    // pad
+
+    while res.len() % 8 > 0 {
+        res.push(0);
     }
 
     res
@@ -89,10 +100,23 @@ fn get_vdso_mem(pid: Pid) -> Result<Vec<u8>, Box<dyn Error>> {
     unsafe { Ok(get_mem(pid, start, end)?) }
 }
 
+fn write_mem(pid: Pid, addr: *mut libc::c_void, data: &Vec<u8>) -> Result<(), Box<dyn Error>> {
+    for offset in (0..data.len()).step_by(8) {
+        let word = i64::from_ne_bytes(data[offset..offset + 8].try_into()?);
+        ptrace::write(pid, addr, word)?;
+    }
+
+    Ok(())
+}
+
 fn get_elf(mem: &Vec<u8>) -> Result<ElfBytes<NativeEndian>, Box<dyn Error>> {
     let p = ElfBytes::<NativeEndian>::minimal_parse(mem)?;
 
     Ok(p)
+}
+
+fn get_seg_addr(p: *mut libc::c_void, st_value: u64, vaddr_offset: u64) -> *mut libc::c_void {
+    unsafe { p.offset(st_value as isize).offset(-(vaddr_offset as isize)) }
 }
 
 fn main() {
@@ -105,14 +129,19 @@ fn main() {
 
     // word-aligned
     let fp = fake_clock_gettime as *const u8;
+
+    let func_b;
     unsafe {
-        println!("{:?}", get_bytes(fp));
+        func_b = get_bytes(fp);
     }
+
+    println!("fn len: {}", func_b.len());
 
     let cmd = &args[1];
     //println!("executing command `{}`", cmd);
 
     let mut c = std::process::Command::new(cmd)
+        .args(args[2..].to_vec())
         .spawn()
         .expect(&format!("error executing command: {}", cmd));
 
@@ -134,14 +163,12 @@ fn main() {
         });
 
     let mem = get_vdso_mem(pid).expect("unable to get vdso mem");
-
     let elf = get_elf(&mem).expect("unable to get elf");
-
     let common = elf.find_common_data().expect("unable to get common");
 
     let dynsyms = common.dynsyms.expect("unable to get dynsyms");
     let strtab = common.dynsyms_strs.expect("unable to get strtab");
-    let _hash = common.sysv_hash.expect("unable to get hash table");
+    let hashmap = common.sysv_hash.expect("unable to get hash table");
 
     let (start, _) = get_vdso_addr(pid).expect("unable to get vdso addr");
 
@@ -158,23 +185,32 @@ fn main() {
         .expect("error getting segments")
         .iter()
         .find(|prog| prog.p_type == PT_LOAD)
-        .map(|prog| prog.p_vaddr - prog.p_offset)
+        .map(|prog| prog.p_vaddr) // - prog.p_offset (I don't think the second part is needed, but chaos-mesh is using it?)
         .unwrap_or_default();
 
+    println!("{}", load_offset);
+
+    // print addr for all offsets
     syms.iter().for_each(|s| {
         let name = strtab.get(s.st_name as usize).expect("unable to get name");
         println!(
             "{:?}: {} ({:#x})",
-            unsafe {
-                // add symbol address, subtract elf offset vals (see https://github.com/chaos-mesh/chaos-mesh/blob/release-1.0/pkg/ptrace/ptrace_linux.go)
-                start
-                    .offset(s.st_value as isize)
-                    .offset(-(load_offset as isize))
-            },
+            get_seg_addr(start, s.st_value, load_offset),
             name,
             s.st_size
         );
     });
+
+    let (_, sym) = hashmap
+        .find(b"clock_gettime", &dynsyms, &strtab)
+        .expect("unable to lookup clock_gettime")
+        .expect("unable to find clock_gettime");
+
+    // clock_gettime addr
+    let addr = get_seg_addr(start, sym.st_value, load_offset);
+    println!("{:?}", addr);
+
+    write_mem(pid, addr, &func_b).expect("unable to write mem");
 
     // detach flow (for some reason the detach hangs sometimes without this)
     ptrace::syscall(pid, Signal::SIGCONT).expect("unable to syscall");
